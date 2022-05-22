@@ -1,5 +1,12 @@
 use std::str::FromStr;
 
+const DIRECTIONS: [Direction; 4] = [
+    Direction::Up,
+    Direction::Down,
+    Direction::Right,
+    Direction::Left,
+];
+
 #[derive(Debug)]
 pub enum GpnError {
     Soft(String),
@@ -37,6 +44,11 @@ pub enum Proto {
         wins: i32,
         loses: i32,
     },
+    Game {
+        width: i32,
+        height: i32,
+        goal: Position,
+    },
 }
 
 impl FromStr for Proto {
@@ -63,6 +75,16 @@ impl FromStr for Proto {
                 pos: Position::parse(&[args[1], args[2]])
                     .map_err(|e| GpnError::ParseError(format!("{e}")))?,
                 space: Direction::parse([args[3], args[4], args[5], args[6]]),
+            }),
+            ("game", 5) => Ok(Proto::Game {
+                width: args[1]
+                    .parse()
+                    .map_err(|e| GpnError::ParseError(format!("{e}")))?,
+                height: args[2]
+                    .parse()
+                    .map_err(|e| GpnError::ParseError(format!("{e}")))?,
+                goal: Position::parse(&args[3..])
+                    .map_err(|e| GpnError::ParseError(format!("{e}")))?,
             }),
             ("win", 3) => Ok(Proto::Win {
                 wins: args[1]
@@ -120,14 +142,46 @@ impl Position {
             Direction::Left => Self { x: x - 1, y },
         }
     }
+
+    pub fn distance(&self, b: &Self) -> f32 {
+        (*self - *b).norm()
+    }
+
+    pub fn norm(&self) -> f32 {
+        ((self.x.pow(2)) as f32 + (self.y.pow(2)) as f32).sqrt()
+    }
+
+    pub fn surroundings(&self) -> Vec<Position> {
+        DIRECTIONS.iter().map(|d| self.add(d)).collect::<Vec<_>>()
+    }
+}
+
+impl From<(i32, i32)> for Position {
+    fn from((x, y): (i32, i32)) -> Position {
+        Self { x, y }
+    }
+}
+
+impl std::ops::Add for Position {
+    type Output = Self;
+    fn add(self, rhs: Self) -> Self::Output {
+        Self::new(self.x + rhs.x, self.y + rhs.y)
+    }
+}
+
+impl std::ops::Sub for Position {
+    type Output = Self;
+    fn sub(self, rhs: Self) -> Self::Output {
+        Self::new(self.x - rhs.x, self.y - rhs.y)
+    }
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
 #[repr(u8)]
 pub enum Direction {
-    Left = 1<<3,
-    Up = 1<<2,
-    Right = 1<<1,
+    Left = 1 << 3,
+    Up = 1 << 2,
+    Right = 1 << 1,
     Down = 1,
 }
 
@@ -161,7 +215,11 @@ impl Direction {
             }
         }
 
-        return out;
+        out
+    }
+
+    pub fn is_dead_end(bits: u8) -> bool {
+        bits == Direction::Up as u8 || bits == Direction::Right as u8 || bits == Direction::Left as u8 || bits == Direction::Down as u8
     }
 
     pub fn inverse(&self) -> Self {
@@ -174,8 +232,13 @@ impl Direction {
     }
 
     pub fn into_bits(slice: &[Direction]) -> u8 {
-        slice.iter().fold(0u8, |a,c| a | *c as u8)
+        slice.iter().fold(0u8, |a, c| a | *c as u8)
     }
+
+    pub const EMTPY: u8 = 0;
+    pub const FLOODED: u8 = 0b10000;
+    pub const START: u8 = 0b100000;
+    pub const GOAL: u8 = 0b1000000;
 
     pub fn into_char(bits: u8) -> char {
         match bits {
@@ -190,8 +253,86 @@ impl Direction {
             13 => '╣',
             14 => '╩',
             15 => '╬',
-            1 | 2 | 3 | 4 => 'x',
-            _ => ' '
+            x if x == Self::FLOODED => '░',
+            x if x == Self::START => 'S',
+            x if x == Self::GOAL => 'G',
+            1 | 2 | 4 | 8 => 'x',
+            _ => ' ',
         }
+    }
+}
+
+type STreeInner = Vec<(Position, Vec<Direction>)>;
+pub struct STree(STreeInner);
+
+impl std::ops::Deref for STree {
+    type Target = STreeInner;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for STree {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl STree {
+    pub fn new() -> Self {
+        Self(STreeInner::new())
+    }
+
+    pub fn get_keys<'a>(&'a self) -> impl Iterator<Item = &'a Position> + '_ {
+        self.iter().map(|(k, _)| k)
+    }
+
+    pub fn contains_key(&self, pos: &Position) -> bool {
+        self.get_keys().any(|k| k == pos)
+    }
+
+    pub fn get_mut(&mut self, pos: &Position) -> Option<&mut Vec<Direction>> {
+        self.iter_mut().find(|(k, _)| k == pos).map(|(_, v)| v)
+    }
+
+    pub fn get(&self, pos: &Position) -> Option<&Vec<Direction>> {
+        self.iter().find(|(k, _)| k == pos).map(|(_, v)| v)
+    }
+}
+
+pub struct State {
+    pub map: Vec<Vec<u8>>,
+    pub start: Position,
+    pub goal: Position,
+    pub size: (i32, i32),
+    pub wins: u32,
+    pub loses: u32,
+}
+
+impl State {
+    const MAX_MAP_SIZE: usize = 64;
+
+    pub fn new() -> Self {
+        Self {
+            map: vec![vec![0; 64]; 64],
+            start: Position::new(32, 32),
+            goal: Position::new(0, 0),
+            size: (0, 0),
+            wins: 0,
+            loses: 0
+        }
+    }
+
+    pub fn reset(&mut self, width: i32, height: i32, goal: Position) {
+        self.map = vec![vec![0; width as usize + 1]; height as usize + 1];
+        self.start = Position::new(0, 0);
+        self.goal = goal;
+        self.size = (width, height);
+    }
+
+    pub fn in_bounds(&self, pos: &Position) -> bool {
+        let (x, y) = self.size;
+        pos.x <= x && pos.y <= y && pos.x >= 0 && pos.y >= 0
     }
 }
